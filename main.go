@@ -5,12 +5,12 @@ import (
 )
 
 const (
-	DefaultProt = ":8080"
+	DefaultPort = ":8080"
 )
 
 func main() {
-	routersInit := router.InitRouter()
-	err := routersInit.Run(DefaultProt)
+	r := router.InitRouter()
+	err := r.Run(DefaultPort)
 	if err != nil {
 		panic(err)
 	}
