@@ -36,6 +36,7 @@ export default defineConfig({
         {
           text: 'Web 项目',
           items: [
+            { text: '项目初始化与路由组织', link: '/web/项目初始化与路由组织' },
             { text: '项目结构', link: '/web/structure' },
             { text: '路由与 HTTP', link: '/web/routing' }
           ]
