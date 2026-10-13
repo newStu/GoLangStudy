@@ -36,9 +36,11 @@ export default defineConfig({
         {
           text: 'Web 项目',
           items: [
-            { text: '项目初始化与路由组织', link: '/web/项目初始化与路由组织' },
-            { text: '项目结构', link: '/web/structure' },
-            { text: '路由与 HTTP', link: '/web/routing' }
+            { text: '01 项目初始化与路由组织', link: '/web/01-项目初始化与路由组织' },
+            { text: '02 登录接口与分层架构', link: '/web/02-登录接口与分层架构' },
+            { text: '03 数据库接入与 GORM', link: '/web/03-数据库接入与GORM' },
+            { text: '项目结构（待补充）', link: '/web/structure' },
+            { text: '路由与 HTTP（待补充）', link: '/web/routing' }
           ]
         }
       ]
