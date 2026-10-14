@@ -12,23 +12,17 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: '首页', link: '/' },
-      { text: '基础语法', link: '/basics/syntax' },
-      { text: 'Web 项目', link: '/web/routing' }
+      { text: '基础语法', link: '/basics/01-channel的关闭与select结束时机' },
+      { text: 'Web 项目', link: '/web/01-项目初始化与路由组织' }
     ],
 
     sidebar: {
       '/basics/': [
         {
-          text: '基础语法',
-          items: [
-            { text: '基础语法', link: '/basics/syntax' }
-          ]
-        },
-        {
           text: '并发编程',
           items: [
-            { text: 'channel 的关闭与 select 结束时机', link: '/basics/channel的关闭与select结束时机' },
-            { text: 'map 线程安全与 sync.Map', link: '/basics/map线程安全与syncMap' }
+            { text: 'channel 的关闭与 select 结束时机', link: '/basics/01-channel的关闭与select结束时机' },
+            { text: 'map 线程安全与 sync.Map', link: '/basics/02-map线程安全与syncMap' }
           ]
         }
       ],
@@ -38,9 +32,7 @@ export default defineConfig({
           items: [
             { text: '01 项目初始化与路由组织', link: '/web/01-项目初始化与路由组织' },
             { text: '02 登录接口与分层架构', link: '/web/02-登录接口与分层架构' },
-            { text: '03 数据库接入与 GORM', link: '/web/03-数据库接入与GORM' },
-            { text: '项目结构（待补充）', link: '/web/structure' },
-            { text: '路由与 HTTP（待补充）', link: '/web/routing' }
+            { text: '03 数据库接入与 GORM', link: '/web/03-数据库接入与GORM' }
           ]
         }
       ]

@@ -8,7 +8,7 @@ hero:
   actions:
     - theme: brand
       text: 开始阅读
-      link: /basics/syntax
+      link: /basics/01-channel的关闭与select结束时机
     - theme: alt
       text: GitHub
       link: https://github.com/gc_wangzhaoyu_ex/GoLangStudy
