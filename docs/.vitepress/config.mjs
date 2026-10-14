@@ -24,6 +24,12 @@ export default defineConfig({
             { text: 'channel 的关闭与 select 结束时机', link: '/basics/01-channel的关闭与select结束时机' },
             { text: 'map 线程安全与 sync.Map', link: '/basics/02-map线程安全与syncMap' }
           ]
+        },
+        {
+          text: '错误处理',
+          items: [
+            { text: '错误处理(error)', link: '/basics/03-错误处理' }
+          ]
         }
       ],
       '/web/': [
@@ -32,7 +38,8 @@ export default defineConfig({
           items: [
             { text: '01 项目初始化与路由组织', link: '/web/01-项目初始化与路由组织' },
             { text: '02 登录接口与分层架构', link: '/web/02-登录接口与分层架构' },
-            { text: '03 数据库接入与 GORM', link: '/web/03-数据库接入与GORM' }
+            { text: '03 数据库接入与 GORM', link: '/web/03-数据库接入与GORM' },
+            { text: '04 参数绑定与校验', link: '/web/04-参数绑定与校验' }
           ]
         }
       ]
