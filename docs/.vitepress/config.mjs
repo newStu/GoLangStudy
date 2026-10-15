@@ -30,6 +30,12 @@ export default defineConfig({
           items: [
             { text: '错误处理(error)', link: '/basics/03-错误处理' }
           ]
+        },
+        {
+          text: '代码审查',
+          items: [
+            { text: '审查 AI 写的 Go 代码实战', link: '/basics/04-审查AI写的Go代码实战' }
+          ]
         }
       ],
       '/web/': [
