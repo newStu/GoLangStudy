@@ -99,7 +99,123 @@ m.Range(func(k, v any) bool {      // 遍历,顺序随机!
 })
 ```
 
-## 三、sync.Map 的实现原理(面试常问)
+## 三、锁到底是什么:给「临界区」的门装一把锁
+
+用 `Mutex` 之前,先把"锁"这个概念掰清楚——**它既不锁 map,也不锁协程,锁的是"一段代码"**。
+
+### 1. 三样东西,别混
+
+| 概念 | 类比 | 对应代码 |
+|---|---|---|
+| 共享资源 | 房间里的**东西** | `m`(map 数据) |
+| 临界区 | **房间** | `Lock()` 到 `Unlock()` 之间的代码 |
+| 锁 | 房间的**门锁 / 唯一钥匙** | `mu` |
+
+```go
+c.mu.Lock()        // 拿钥匙开门
+c.m[key]++         // 进屋动 map(临界区)
+c.mu.Unlock()      // 出门还钥匙
+```
+
+含义:**任何走到 `mu.Lock()` 的协程都要抢这把钥匙,抢不到就在门口排队。** 于是并发读写被强制成"一次一个"。
+
+关键:**Go 里没有"给 map 上锁"这回事**。map 不认识锁,锁也不认识 map——是**你(人)约定**"所有碰这个 map 的地方都用同一把 `mu`"。约定成立,保护才成立。
+
+### 2. 不是"看看解锁没",是"阻塞排队"
+
+```go
+c.mu.Lock()   // 锁被占着 → 当前协程【停在原地睡着】,直到有人 Unlock 把它唤醒
+```
+
+不是"轮询看看空没空"(那会空耗 CPU),而是**进不去就挂起、让出 CPU、进等待队列**;`Unlock()` 像叫号,唤醒一个等待者。
+
+> 前端类比:不是 `while (locked) {}` 忙等,而是 `await mutex.acquire()` ——没拿到就一直停在那一行。
+
+一个能亲眼验证"是阻塞不是轮询"的小实验:
+
+```go
+var mu sync.Mutex
+
+func main() {
+	mu.Lock()
+	go func() {
+		fmt.Println("乙: 想拿锁")
+		mu.Lock()                 // 阻塞在这里,不会往下走
+		fmt.Println("乙: 拿到锁了") // 3 秒后才打印
+		mu.Unlock()
+	}()
+
+	time.Sleep(3 * time.Second)
+	fmt.Println("甲: 放锁")
+	mu.Unlock()                   // 唤醒乙
+	time.Sleep(100 * time.Millisecond)
+}
+```
+
+输出:先 `乙: 想拿锁` → 卡 3 秒(期间乙什么都不打印,证明它睡着了)→ `甲: 放锁` → `乙: 拿到锁了`。
+
+### 3. 两个协程都要加锁,而且必须是"同一把"
+
+```go
+var mu sync.Mutex                        // 用 var,不要 mu := sync.Mutex
+m := make(map[string]string)
+
+go func() { mu.Lock(); /* 读 m */; mu.Unlock() }()
+go func() { mu.Lock(); /* 写 m */; mu.Unlock() }()
+```
+
+两个协程**都要** Lock/Unlock,而且要抢**同一把 `mu`**(上面是同一函数内的闭包,捕获的就是同一个变量,成立)。
+
+**不变量**:所有碰 `m` 的代码,都得用同一把锁包起来;**漏一处 = 保护破**。
+
+### 4. 不同方法里,怎么共享这把锁?
+
+**不要到处传 `mu` 参数**,推荐把"锁 + 它保护的资源"打包进 struct:
+
+```go
+type Store struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (s *Store) Get(k string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m[k]
+}
+
+func (s *Store) Set(k, v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m[k] = v
+}
+```
+
+两个方法通过同一个 receiver `s` 访问同一个 `s.mu`,天然共享(这也是上面 `lockedCounter` 的写法)。
+
+如果非要传参,**必须传指针** `*sync.Mutex`:
+
+```go
+func read(mu *sync.Mutex, m map[string]string) { ... }  // ✅ 共享同一把
+func read(mu sync.Mutex,  m map[string]string) { ... }  // ❌ 复制锁!
+```
+
+**为什么传值会废**:`sync.Mutex` 是有状态的(记着"锁没锁、谁在等")。按值传参会**复制**状态,两个方法拿到**两把互不相干的锁** → 不互斥。`go vet` 会报 `passes lock by value`。
+**记忆:`sync.Mutex` 一旦用过就绝不能复制**,装它的 struct 也要用 `*Store` 指针传。
+
+### 5. 五种写法对照
+
+| 写法 | 共享锁? | 评价 |
+|---|---|---|
+| struct + 方法(用 `s.mu`) | ✅ | **推荐**,资源与锁绑定 |
+| 传 `*sync.Mutex` 参数 | ✅ | 能用,必须是指针 |
+| 传 `sync.Mutex` 值 | ❌ | 复制锁,保护失效(vet 报警) |
+| 各方法各 `new` 一把 | ❌ | 完全不同锁,等于没锁 |
+| 同函数内闭包共享同一 `mu` | ✅ | 可行 |
+
+**一句话**:锁必须"众人共用同一把";把锁和被保护的 map **放进同一个 struct**,是让"共用"自动成立的最省心方式。
+
+## 四、sync.Map 的实现原理(面试常问)
 
 `sync.Map` 内部维护两个结构:
 
@@ -128,7 +244,7 @@ type Map struct {
 | 写入新 key | ⚠️ 慢 | 要加锁操作 dirty |
 | 删除 key | ⚠️ 一般 | 惰性删除,有额外开销 |
 
-## 四、选型:什么时候用哪个
+## 五、选型:什么时候用哪个
 
 官方文档(`sync.Map` 的注释)给出的适用场景,翻译过来就是:
 
@@ -144,7 +260,7 @@ type Map struct {
 
 一句话:**sync.Map 不是"更好的 map",而是"为两个特殊场景优化的 map"**。写多场景用它反而更慢(每次新 key 都要过锁 + 可能触发 dirty 重建)。
 
-## 五、踩坑记录
+## 六、踩坑记录
 
 1. **值是 `any`,忘记类型断言会在用的时候 panic**:
 
@@ -173,9 +289,10 @@ type Map struct {
 
 6. **吞掉类型错误**。普通 map 写错类型编译就报错,sync.Map 要到运行时断言才炸,问题暴露得晚。Go 1.9 加入 sync.Map 时社区就有人建议包一层泛型(1.18+ 可以自己写 `type ConcurrentMap[K comparable, V any]` 封装),既有类型安全又有清晰 API。
 
-## 六、总结
+## 七、总结
 
 - 普通 map 并发读写 = `fatal error`,recover 救不了,`-race` 提前查。
 - 三件套:**Mutex(通用)→ RWMutex(读多写少)→ sync.Map(读多写少 + key 稳定 / 分片写入)**。
+- 锁保护的是"**临界区**"(一段代码),不是 map 也不是协程;两处访问必须共用**同一把**锁,而且 `sync.Mutex` 绝不能复制(传参传指针,struct 用 `*Store`)。
 - sync.Map 快的本质:read 无锁 + entry 指针共享,更新已有 key 不加锁。
 - sync.Map 值是 `any`:断言、无 Len、内部值要自己保护,三个坑记住。
