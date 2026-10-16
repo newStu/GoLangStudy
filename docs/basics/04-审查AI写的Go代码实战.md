@@ -1,8 +1,8 @@
-# Go 笔记:审查 AI 生成的 Go 代码(实战三讲)
+# Go 笔记:审查 AI 生成的 Go 代码(实战四讲)
 
 > 学 Go 的目标不是"会写"——AI 写得比人快。真正的目标是**会审**:AI 像一个手速极快、
 > 从不提问、还特别自信的中级工程师,它能把功能实现出来,但**判断不了并发安不安全、
-> 错误该不该吞、逻辑该不该存在**。这篇笔记把三轮"找 bug"实战整理成一套可复用的
+> 错误该不该吞、逻辑该不该存在**。这篇笔记把四轮"找 bug"实战整理成一套可复用的
 > **审查肌肉记忆**,每一轮都藏了若干 AI 高频翻车的坑,外加一个"看着像 bug、其实安全"
 > 的诱饵,专门训练"判断力"而不是"挑刺欲"。
 >
@@ -25,9 +25,9 @@
 AI 现在满级的是"怎么实现"。所以你的位置不是跟它比谁写得多(必输),而是**坐到它上面**:
 它输出,你审。**审得过它,你就是资深,它就是你的初级。**
 
-## 二、三轮实战的公共敌人:三类 bug
+## 二、四轮实战的公共敌人:三类 bug
 
-三轮的坑看着五花八门,归到最后就三类,而且**恰好都是 AI 最爱犯、光看代码看不出来的**:
+四轮的坑看着五花八门,归到最后就三类,而且**恰好都是 AI 最爱犯、光看代码看不出来的**:
 
 1. **要"脑内模拟运行时"才看得见** —— 竞态、死锁、泄漏。代码静态看没毛病,跑到特定时机才炸。
 2. **要"想攻击者/想异常输入"才看得见** —— SQL 注入、未校验的参数、缺 return 导致的 panic。
@@ -649,13 +649,242 @@ C 发完 → close(jobCh) → worker 的 range 退出 → wg 计数归零
 
 ---
 
-## 六、拿走这套心智模型
+## 六、第四轮:带后台刷新的内存缓存(4 坑 + 1 诱饵)
 
-审并发代码卡住时,问自己三句话:
+> 换战场到并发三件套:**context 取消传播 / 锁粒度 / select 多路复用**。核心结论一句话:
+> **函数签名写了 `ctx` 不算数,有人 `select` 它才算数。**
+
+### 题目代码
+
+```go
+type Cache struct {
+	mu   sync.Mutex
+	data map[string]string
+}
+
+// Get:命中直接返回;miss 时回源(慢)
+func (c *Cache) Get(ctx context.Context, key string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if v, ok := c.data[key]; ok {
+		return v, nil
+	}
+
+	v, err := fetchFromSource(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	c.data[key] = v
+	return v, nil
+}
+
+func fetchFromSource(ctx context.Context, key string) (string, error) {
+	time.Sleep(200 * time.Millisecond) // 模拟一次慢网络请求
+	return "value-" + key, nil
+}
+
+// Refresh:后台定时刷新一批 key
+func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	for {
+		select {
+		case <-ticker.C:
+			for _, k := range keys {
+				v, err := fetchFromSource(ctx, k)
+				if err != nil {
+					fmt.Println("refresh error:", err)
+					continue
+				}
+				c.mu.Lock()
+				c.data[k] = v
+				c.mu.Unlock()
+			}
+		}
+	}
+}
+```
+
+### 坑 1:锁粒度——持锁做慢 I/O(**性能 bug,不是正确性**)
+
+```go
+c.mu.Lock()
+defer c.mu.Unlock()                   // 锁一直握到函数结束
+...
+v, err := fetchFromSource(ctx, key)   // 慢操作(200ms)在【锁内】跑
+```
+
+`Get` 持锁到结束。一次 cache miss 时,`fetchFromSource` 那 200ms 全程占锁 → **其他所有 `Get`
+(哪怕命中缓存的)全部阻塞等锁** → 缓存退化成**串行**。
+
+**这是本轮唯一一个"不算错但必须报"的坑**:结果没错,吞吐塌了。
+
+> 前端类比:`async` 逻辑里做了同步阻塞操作,把事件循环卡住 200ms,所有请求排队。
+
+**修**:读命中用短锁,miss 时**释放锁再回源**,回源完再短锁写回:
+
+```go
+c.mu.RLock()
+v, ok := c.data[key]
+c.mu.RUnlock()
+if ok { return v, nil }
+
+v, err := fetchFromSource(ctx, key) // I/O 不持锁
+if err != nil { return "", err }
+
+c.mu.Lock()
+c.data[key] = v
+c.mu.Unlock()
+```
+
+### 坑 2:context 取消不传播
+
+```go
+func fetchFromSource(ctx context.Context, key string) (string, error) {
+	time.Sleep(200 * time.Millisecond)   // 收下了 ctx,却一眼没看
+	return "value-" + key, nil
+}
+```
+
+`ctx` **收下却从没用**——"接口骗人"。调用方取消时 `ctx.Done()` 早 close 了,`Sleep` 照样睡满,
+取消信号断在这里。
+
+**修**:真正的 I/O 把 ctx 传到底:
+
+```go
+select {
+case <-time.After(200 * time.Millisecond):
+	return "value-" + key, nil
+case <-ctx.Done():
+	return "", ctx.Err()
+}
+```
+
+### 坑 3:select 缺 `ctx.Done()` → goroutine 永久泄漏
+
+```go
+select {
+case <-ticker.C:        // 只有这一路
+	...
+}
+```
+
+`Refresh` 也把 `ctx` 收下了,但 `select` 里**没有 `case <-ctx.Done()`** → `for` 循环**没有退出
+路径** → goroutine **永远无法取消 → 泄漏**。又是"ctx 收了不用"。
+
+**select 的本质是"多路等待,谁先来走谁"**,只挂 ticker 一路,就丢了"取消"这一路。**规范的
+select 至少要有 `ctx.Done()` 这条路**,否则这个 goroutine 别人关不掉。
+
+> 前端类比:`setInterval` 跑着,却没有对应的 `clearInterval`。
+
+**修**:加一路 `case <-ctx.Done(): return`。
+
+### 坑 4:ticker 没 Stop(资源泄漏)
+
+```go
+ticker := time.NewTicker(interval)
+// 少了:defer ticker.Stop()
+```
+
+`NewTicker` 的资源不 Stop 就不回收。**`NewTicker` ↔ `defer ticker.Stop()`** 是 defer 配对哲学
+的一条。
+
+### 🎣 诱饵:map 不需要 `sync.Map`
+
+学过第一轮"map 并发会崩"的人容易反射性喊"换 `sync.Map`"——**错**。第一轮崩是因为 map
+**没加锁**;这里 `data` 的每次读写都在 `c.mu` 保护下,**已经并发安全**。
+
+> `sync.Map` 只在"读多写少且键不重叠"的特定场景才划算;**普通场景 `Mutex` + 普通 map 才是
+> 标准做法**。诱饵考的是:把"map 要加锁"这个正确结论,和"必须用 sync.Map"这个错误做法分开。
+>
+> (换 `RWMutex` + 读锁是**优化**,不是 bug——别当错误报。)
+
+### 汇总
+
+| # | 类别 | 位置 | 后果 | 性质 |
+|---|---|---|---|---|
+| 1 | 锁粒度 | 持锁做 `fetchFromSource` | 缓存退化成串行 | 性能 bug |
+| 2 | context 传播 | `fetchFromSource` 忽略 ctx | 取消信号断掉 | 正确性 |
+| 3 | select | 缺 `case <-ctx.Done()` | goroutine 永久泄漏 | 正确性 |
+| 4 | 资源 | 缺 `defer ticker.Stop()` | ticker 泄漏 | 正确性 |
+| 🎣 | 诱饵 | map"并发不安全" | 无,已被 mu 保护 | 安全 |
+
+**坑 2、3 是同一个病**:ctx 收下却从不 observe。判断"取消能不能传播",就看链上每一环有没有
+真的读 `ctx.Done()`——**签名写 `ctx` 不算数,有人 select 它才算数**。
+
+### 修正版
+
+```go
+type Cache struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+func (c *Cache) Get(ctx context.Context, key string) (string, error) {
+	c.mu.RLock() // 读:短锁
+	v, ok := c.data[key]
+	c.mu.RUnlock()
+	if ok {
+		return v, nil
+	}
+
+	v, err := fetchFromSource(ctx, key) // I/O 不持锁
+	if err != nil {
+		return "", err
+	}
+
+	c.mu.Lock() // 写:短锁
+	c.data[key] = v
+	c.mu.Unlock()
+	return v, nil
+}
+
+func fetchFromSource(ctx context.Context, key string) (string, error) {
+	select {
+	case <-time.After(200 * time.Millisecond):
+		return "value-" + key, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, k := range keys {
+				v, err := fetchFromSource(ctx, k)
+				if err != nil {
+					fmt.Println("refresh error:", err)
+					continue
+				}
+				c.mu.Lock()
+				c.data[k] = v
+				c.mu.Unlock()
+			}
+		}
+	}
+}
+```
+
+> `ponytail:` 修正版 `Get` 的 miss 仍存在**惊群**——多个 goroutine 同时 miss 同一 key 会重复
+> 回源。真上线可加 `singleflight.Group` 合并;当前规模够用,先不引入依赖。
+
+---
+
+## 七、拿走这套心智模型
+
+审并发代码卡住时,问自己五句话:
 
 1. **谁产生,谁关闭?**(channel 归属——发送方关闭,接收方绝不 close)
 2. **发和收,是不是同时在跑?**(无缓冲会不会互等 → 死锁)
 3. **计数/信号,有没有 happens-before 保证?**(`Add` 要在 `Wait` 前、signal 要在等之前)
+4. **锁的持有范围有没有跨越 I/O?**(锁里只放"读/写内存",慢操作一律挪出去)
+5. **ctx 从入口到出口,每一环都真的 observe 了吗?**(谁没 `select ctx.Done()`,取消就断在哪)
 
 审资源类代码卡住时,记住**"defer 配对哲学"**——拿到什么就 defer 还什么:
 
@@ -668,7 +897,7 @@ C 发完 → close(jobCh) → worker 的 range 退出 → wg 计数归零
 
 这一条能挡掉未来 80% 的资源类 review 意见。
 
-## 七、审查 checklist(扫 AI 的 Go 代码直接用)
+## 八、审查 checklist(扫 AI 的 Go 代码直接用)
 
 ### 并发 / 同步
 - [ ] 共享的 map / slice 是否只在单个 goroutine 里读写?多个 goroutine 就得上锁或换 `sync.Map`
@@ -677,6 +906,17 @@ C 发完 → close(jobCh) → worker 的 range 退出 → wg 计数归零
 - [ ] 无缓冲 channel 的生产者和消费者是否**并发**跑?会不会互等死锁?
 - [ ] `for ... go func(){ 用循环变量 }()` —— 循环变量有没有显式传参?(Go < 1.22)
 - [ ] 每个新起的 goroutine panic 会不会拖垮整个进程?该 recover 的 recover 了吗?
+
+### context 取消
+- [ ] 每个接收 `ctx` 的函数,**真的用了它**吗?有没有"收下不用"的接口骗人?
+- [ ] 所有可能阻塞的点(网络 / DB / sleep / channel 收发),都 `select` 了 `ctx.Done()` 吗?
+- [ ] `select` 里是不是至少有一条 `case <-ctx.Done()`(否则 goroutine 关不掉)?
+- [ ] `time.NewTicker` / `NewTimer` 有配对的 `defer Stop()` 吗?
+
+### 锁 / 临界区
+- [ ] 锁的持有范围**没有跨越任何 I/O** 吗?(网络 / 磁盘 / 外部调用一律挪到锁外)
+- [ ] 只读路径考虑过 `RWMutex` 读锁吗(优化项,不是必须)?
+- [ ] map 是否**始终**在同一把锁下读写?(加了锁就够,不必上 `sync.Map`)
 
 ### 资源
 - [ ] 每个 `Query*` / `http.Get` / `os.Open` 后面有 `defer ...Close()` 吗?
@@ -705,5 +945,6 @@ C 发完 → close(jobCh) → worker 的 range 退出 → wg 计数归零
 ---
 
 > **一句话收尾**:AI 让你**不用写** Go,但没让你**不用懂** Go。真正要练的不是"写"的能力,
-> 是"**审和兜底**"的能力——三句话(谁产生谁关闭 / 发收是否并发 / happens-before)、
-> 一张 checklist、外加"诱饵"训练出的判断力。练到"扫一眼就能说清哪行会炸",你就是审 Go 的人。
+> 是"**审和兜底**"的能力——五句话(谁产生谁关闭 / 发收是否并发 / happens-before /
+> 锁有没有跨 I/O / ctx 每一环 observe 了吗)、一张 checklist、外加"诱饵"训练出的判断力。
+> 练到"扫一眼就能说清哪行会炸",你就是审 Go 的人。
