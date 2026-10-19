@@ -1,8 +1,8 @@
-# Go 笔记:审查 AI 生成的 Go 代码(实战四讲)
+# Go 笔记:审查 AI 生成的 Go 代码(实战五讲)
 
 > 学 Go 的目标不是"会写"——AI 写得比人快。真正的目标是**会审**:AI 像一个手速极快、
 > 从不提问、还特别自信的中级工程师,它能把功能实现出来,但**判断不了并发安不安全、
-> 错误该不该吞、逻辑该不该存在**。这篇笔记把四轮"找 bug"实战整理成一套可复用的
+> 错误该不该吞、逻辑该不该存在**。这篇笔记把五轮"找 bug"实战整理成一套可复用的
 > **审查肌肉记忆**,每一轮都藏了若干 AI 高频翻车的坑,外加一个"看着像 bug、其实安全"
 > 的诱饵,专门训练"判断力"而不是"挑刺欲"。
 >
@@ -25,9 +25,9 @@
 AI 现在满级的是"怎么实现"。所以你的位置不是跟它比谁写得多(必输),而是**坐到它上面**:
 它输出,你审。**审得过它,你就是资深,它就是你的初级。**
 
-## 二、四轮实战的公共敌人:三类 bug
+## 二、五轮实战的公共敌人:三类 bug
 
-四轮的坑看着五花八门,归到最后就三类,而且**恰好都是 AI 最爱犯、光看代码看不出来的**:
+五轮的坑看着五花八门,归到最后就三类,而且**恰好都是 AI 最爱犯、光看代码看不出来的**:
 
 1. **要"脑内模拟运行时"才看得见** —— 竞态、死锁、泄漏。代码静态看没毛病,跑到特定时机才炸。
 2. **要"想攻击者/想异常输入"才看得见** —— SQL 注入、未校验的参数、缺 return 导致的 panic。
@@ -876,7 +876,292 @@ func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Durati
 
 ---
 
-## 七、拿走这套心智模型
+## 七、第五轮:批量导入 CSV(4 坑 + 1 诱饵)
+
+> 换战场到**错误处理 / 资源生命周期 / 信任边界**——"能跑但数据不对"的重灾区。
+> 核心结论一句话:**错误的唯一合法去处是往上抛,不是 let it disappear。**
+
+### 题目代码
+
+场景:把目录下所有 CSV 导入数据库。
+
+```go
+// ImportDir 把 dir 下所有 csv 导入数据库,返回导入行数
+func ImportDir(db *sql.DB, dir string) (count int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, fmt.Errorf("read dir: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+
+		f, err := os.Open(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return count, err
+		}
+		defer f.Close()
+
+		r := csv.NewReader(f)
+		records, err := r.ReadAll()
+		if err != nil {
+			continue
+		}
+
+		for _, rec := range records {
+			row := Row{Name: rec[0], Email: rec[1]}
+			if err := insert(tx, row); err != nil {
+				return count, err
+			}
+			count++
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return count, err
+	}
+	return count, nil
+}
+
+func insert(tx *sql.Tx, row Row) error {
+	_, err := tx.Exec("INSERT INTO users(name, email) VALUES(?, ?)", row.Name, row.Email)
+	if err != nil {
+		return fmt.Errorf("insert %s: %v", row.Email, err)
+	}
+	return nil
+}
+```
+
+### 坑 1:`defer f.Close()` 写在循环内(资源泄漏)
+
+```go
+for _, e := range entries {
+	f, err := os.Open(...)
+	defer f.Close()          // ← defer 的执行时机是【函数返回】,不是循环体结束
+}
+```
+
+一万个文件 → 一万个 fd 全挂在函数退出前才释放 → `too many open files`,导入到一半全挂。
+报错点在 `os.Open`,看着像"系统限制",根因是这行 `defer`。
+
+> **`defer` 的作用域边界是函数,不是代码块。**
+
+**前端类比**:`for` 里读了一万个文件流,却把所有 `stream.close()` 攒到最后才调;或者
+`for` 里 `addEventListener` 不 `remove`——同一个形状。
+
+**修**:把单文件逻辑抽成函数,`defer` 跟着函数作用域自然收敛:
+
+```go
+n, err := importFile(tx, path)   // defer 在 importFile 内,每次调用结束就还
+```
+
+### 坑 2:CSV 解析错误被 `continue` 吞掉(数据静默丢失)
+
+```go
+records, err := r.ReadAll()
+if err != nil {
+    continue          // ← 这个文件整体跳过,外面一无所知
+}
+```
+
+编码不对、格式坏掉的文件被悄悄跳过。整批导入"成功返回",`count` 少了几百行,
+**没人知道少了、少了哪个文件**。
+
+这和第一轮 `if err != nil` 只 print、第二轮 `rows.Scan` 不接 err、第三轮 `process` 只打印
+是**同一个病**:
+
+> **错误的唯一合法去处是往上抛(或明确记日志 + 计数上报),不是 `continue`。**
+
+### 坑 3:`%v` 而不是 `%w`(错误链断了)
+
+```go
+return fmt.Errorf("insert %s: %v", row.Email, err)
+```
+
+打印出来很好看:`insert a@b.com: UNIQUE constraint failed`。但 **`%v` 是把 error 字符串化后
+重新造了一个新 error,原始 error 从链上掉了**。调用方:
+
+```go
+errors.Is(err, sql.ErrNoRows)     // ← 永远 false
+errors.As(err, &uniqueErr)        // ← 永远 false
+```
+
+**永远失效**,只能去字符串匹配错误消息——脆弱到升一版驱动就崩。
+
+**修**:`%w` 保留链:
+
+```go
+return fmt.Errorf("insert %s: %w", row.Email, err)
+```
+
+> 前端类比:`throw new Error(\`insert failed: ${e.message}\`)` 把 `cause` 丢了,
+> 还是 `throw new Error(msg, { cause: e })`。前者 `instanceof` / `e.cause` 全拿不到,
+> 只剩一句给人看的字符串。
+>
+> **`%v` 给人看,`%w` 给 `errors.Is/As` 用。包装错误默认写 `%w`,除非你故意想切断判断。**
+
+### 坑 4:`rec[1]` 没有长度校验(信任边界,直接 panic)
+
+```go
+row := Row{Name: rec[0], Email: rec[1]}   // rec 可能只有 1 列、甚至 0 列
+```
+
+CSV 是**外部输入**,不守规矩是常态。首行只有 1 列时,`csv.Reader` 把 `FieldsPerRecord`
+定成 1,后面所有行都"合法"地只有 1 个字段 → `rec[1]` **index out of range → panic**。
+
+不走 error 返回,**直接掀桌**:在 HTTP handler 里就是一次 500;panic 发生在无 recover 的
+goroutine 里 → **整个进程挂掉**。
+
+**修**:进业务前验形状。
+
+```go
+if len(rec) < 2 {
+    return 0, fmt.Errorf("%s:%d: 需要 2 列,实际 %d 列", path, i+1, len(rec))
+}
+```
+
+> **信任边界三件套**:URL 参数(第二轮)、文件内容(本轮)、第三方响应。凡是"外面来的",
+> 进业务前先验形状——长度、类型、非空。
+
+### 🎣 诱饵:`defer tx.Rollback()` 忽略了 error
+
+```go
+defer tx.Rollback()   // ← "返回值没接!"
+```
+
+**这是标准写法,别改。** `Commit` 成功后 `Rollback` 返回 `sql.ErrTxDone`——事务已经结束,
+回滚无事可做,**这正是你要的**:
+
+- Commit 失败 → Rollback 真的回滚;
+- Commit 成功 → Rollback 空转,返回一个无害的错。
+
+你要是把它接住并上报,每次成功导入都会多一条假错误日志。
+
+唯一要注意的是**位置**:必须在 `db.Begin()` 的 err 检查**之后**。放前面 → Begin 失败时
+`tx` 是 nil → `defer` 里 nil pointer panic。
+
+### 本轮出现的三个误判(比找对坑更值钱)
+
+这三条是真实答题记录,都是"看着像 bug"的直觉,必须拧正:
+
+**① "`os.Open` 失败也要 Close"** —— 错。失败时 `f` 是 nil,没有资源可关,`Close` 直接 panic。
+真正的坑是 `defer` 的位置(坑 1),不是失败路径。
+
+**② "`insert` 应该用协程跑"** —— 错,而且会引入新 bug:
+
+1. **`*sql.Tx` 不是并发安全的**。Go 文档明写:一个事务上的操作必须串行。多 goroutine 往同一
+   个 `tx` 里 `Exec` → 行为未定义。
+2. **`count++` 会变成竞态**——就是第一轮那个坑,换个马甲。
+3. **一个事务本来就串行**。数据库执行 INSERT 顺序提交,客户端开 10 个 goroutine,到服务端
+   还是排队,只多了一堆错误合并与协调。
+
+> **senior 的反射**:看到"循环里做事慢",先问**慢在客户端还是服务端**。是服务端,客户端开
+> 协程只是把排队搬到本地。想快靠批量 `INSERT ... VALUES (?,?),(?,?)` 和减少事务往返。
+
+**③ "`count` 在 commit 前就自增,返回值骗人"** —— **对,而且很 senior**。
+`count++` 一路涨,`tx.Commit()` 失败时返回 `count=9999, err="commit failed"`,调用方可能
+当"导了 9999 条"处理,**实际一条都没落库**。
+
+> **修**:Commit 失败就 `return 0, err`。别让返回值说一半真话。
+
+### 汇总
+
+| # | 类别 | 位置 | 后果 | 触发条件 |
+|---|---|---|---|---|
+| 1 | 资源泄漏 | 循环内 `defer f.Close()` | `too many open files` | 文件数变多时 |
+| 2 | 错误处理 | `ReadAll` err 后 `continue` | 整文件静默跳过,数据缺失 | CSV 编码/格式异常 |
+| 3 | 错误链 | `fmt.Errorf` 用 `%v` | `errors.Is/As` 永远 false | 调用方想分支处理时 |
+| 4 | 信任边界 | `rec[1]` 无长度校验 | index out of range panic | 畸形 CSV(首行列数少) |
+| 5 | 返回值语义 | commit 前 `count++`,失败仍返回 count | 调用方误判导入成功量 | commit 失败时 |
+| 🎣 | 诱饵 | `defer tx.Rollback()` 忽略 error | 无,标准姿势 | 永远安全 |
+
+### 修正版
+
+```go
+func ImportDir(db *sql.DB, dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, fmt.Errorf("read dir: %w", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback() // 成功后返回 ErrTxDone,无害
+
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n, err := importFile(tx, filepath.Join(dir, e.Name()))
+		if err != nil {
+			return 0, err // 整体回滚,count 不作数
+		}
+		count += n
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return count, nil
+}
+
+func importFile(tx *sql.Tx, path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close() // 生命周期绑定本次调用,不累积
+
+	records, err := csv.NewReader(f).ReadAll() // ponytail: 整文件入内存,超大文件改 Read() 流式
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	n := 0
+	for i, rec := range records {
+		if len(rec) < 2 {
+			return 0, fmt.Errorf("%s:%d: 需要 2 列,实际 %d 列", path, i+1, len(rec))
+		}
+		if err := insert(tx, Row{Name: rec[0], Email: rec[1]}); err != nil {
+			return 0, err
+		}
+		n++
+	}
+	return n, nil
+}
+
+func insert(tx *sql.Tx, row Row) error {
+	if _, err := tx.Exec("INSERT INTO users(name, email) VALUES(?, ?)", row.Name, row.Email); err != nil {
+		return fmt.Errorf("insert %s: %w", row.Email, err)
+	}
+	return nil
+}
+```
+
+改动只有 5 处:**defer 收进小函数、吞错改上报、`%v`→`%w`、列数校验、commit 失败不返回 count**。
+业务逻辑一行没动。
+
+### 本轮该带走的三条
+
+1. **`defer` 的边界是函数,不是代码块。** 循环里拿到资源,要么显式关,要么把那段逻辑抽成
+   函数让 defer 自然收敛。
+2. **`%w` 是错误可编程的唯一方式。** `%v` 给人看,`%w` 给 `errors.Is/As` 用。
+3. **循环 + 外部输入 = 必须验形状。** 长度、类型、非空,进业务前挡住。`panic` 不是错误处理。
+
+---
+
+## 八、拿走这套心智模型
 
 审并发代码卡住时,问自己五句话:
 
@@ -885,6 +1170,12 @@ func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Durati
 3. **计数/信号,有没有 happens-before 保证?**(`Add` 要在 `Wait` 前、signal 要在等之前)
 4. **锁的持有范围有没有跨越 I/O?**(锁里只放"读/写内存",慢操作一律挪出去)
 5. **ctx 从入口到出口,每一环都真的 observe 了吗?**(谁没 `select ctx.Done()`,取消就断在哪)
+
+审错误与资源类代码时,再问三句话:
+
+6. **每个 `err` 的出口在哪?**(`if err != nil` 之后是 `return` / 上报,还是 print / continue = 吞)
+7. **`defer` 的边界是函数还是循环?**(循环里 `defer` = 堆积到函数返回才释放)
+8. **包装错误用 `%v` 还是 `%w`?**(`%v` 断链,`errors.Is/As` 全部失效)
 
 审资源类代码卡住时,记住**"defer 配对哲学"**——拿到什么就 defer 还什么:
 
@@ -895,9 +1186,12 @@ func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Durati
 | `http.Get` | `defer resp.Body.Close()` |
 | `os.Open` | `defer f.Close()` |
 
+**但配对只是第一步,位置同样重要**:同一句 `defer f.Close()` 在函数开头是对的,在循环体里
+就是 fd 泄漏。**defer 的执行时机永远是"当前函数返回",不是"当前代码块结束"。**
+
 这一条能挡掉未来 80% 的资源类 review 意见。
 
-## 八、审查 checklist(扫 AI 的 Go 代码直接用)
+## 九、审查 checklist(扫 AI 的 Go 代码直接用)
 
 ### 并发 / 同步
 - [ ] 共享的 map / slice 是否只在单个 goroutine 里读写?多个 goroutine 就得上锁或换 `sync.Map`
@@ -920,17 +1214,25 @@ func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Durati
 
 ### 资源
 - [ ] 每个 `Query*` / `http.Get` / `os.Open` 后面有 `defer ...Close()` 吗?
+- [ ] `defer ...Close()` 是不是写进了**循环体内**?(defer 到函数返回才执行 → fd 堆积)
 - [ ] `context.WithTimeout` / `WithCancel` 的 `cancel` 有 `defer cancel()` 吗?
 - [ ] `rows.Err()` 查了吗(区分"真读完"和"中途出错")?
 
 ### 错误处理
 - [ ] 每个 `if err != nil` 都 `return`(或显式处理)了吗?有没有往下走导致 nil 解引用?
-- [ ] 有没有"只 print 不返回",把错误吞掉的?
+- [ ] 有没有"只 print 不返回"或"`continue` 掉",把错误吞掉的?
 - [ ] 错误有没有往上抛的出口(返回 error / errCh),而不是就地消失?
+- [ ] 包装错误用 `%w` 而不是 `%v` 了吗?(`%v` 断链 → `errors.Is/As` 永远 false)
+- [ ] 失败路径上的返回值会不会"说一半真话"?(如 commit 失败仍返回累计 `count`)
+
+### 事务
+- [ ] `defer tx.Rollback()` 在 `db.Begin()` 的 err 检查**之后**吗?(放前面 → Begin 失败时 nil panic)
+- [ ] 有没有把 `*sql.Tx` 丢给多个 goroutine 用?(事务必须串行,否则行为未定义)
 
 ### 安全 / 信任边界
 - [ ] SQL 是不是参数化(`?`),没有 `fmt.Sprintf` 拼接?
 - [ ] URL / 请求参数进业务前校验了吗?
+- [ ] 外部内容(文件、CSV、第三方响应)进业务前**验形状**了吗?长度、类型、非空——`rec[1]` 会不会越界 panic?
 - [ ] 错误详情有没有直接返回给前端(可能泄露表名/SQL/连接串)?
 
 ### 序列化 / 语义边界
@@ -945,6 +1247,7 @@ func (c *Cache) Refresh(ctx context.Context, keys []string, interval time.Durati
 ---
 
 > **一句话收尾**:AI 让你**不用写** Go,但没让你**不用懂** Go。真正要练的不是"写"的能力,
-> 是"**审和兜底**"的能力——五句话(谁产生谁关闭 / 发收是否并发 / happens-before /
-> 锁有没有跨 I/O / ctx 每一环 observe 了吗)、一张 checklist、外加"诱饵"训练出的判断力。
+> 是"**审和兜底**"的能力——八句话(谁产生谁关闭 / 发收是否并发 / happens-before /
+> 锁有没有跨 I/O / ctx 每一环 observe 了吗 / err 的出口在哪 / defer 的边界是函数还是循环 /
+> 包装用 `%v` 还是 `%w`)、一张 checklist、外加"诱饵"训练出的判断力。
 > 练到"扫一眼就能说清哪行会炸",你就是审 Go 的人。
